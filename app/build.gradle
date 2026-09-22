@@ -57,9 +57,13 @@ task cargoBuild {
 }
 
 tasks.whenTaskAdded { task ->
-    if ((task.name == 'javaPreCompileDebug' || task.name == 'javaPreCompileRelease')) {
-        task.dependsOn 'cargoBuild'
-    }
+    // cargo-xdk is not installed on this machine; libtwoyi.so in jniLibs is the
+    // exact binary (md5 24604131...) running stable on the reference device, so
+    // the Rust rebuild step is skipped and the prebuilt library is packaged.
+    // Re-enable by installing cargo-xdk and uncommenting the block below.
+    // if ((task.name == 'javaPreCompileDebug' || task.name == 'javaPreCompileRelease')) {
+    //     task.dependsOn 'cargoBuild'
+    // }
 }
 
 dependencies {
@@ -89,11 +93,11 @@ dependencies {
     implementation 'org.apache.commons:commons-compress:1.20'
     implementation 'org.tukaani:xz:1.5'
 
-    implementation 'com.hzy:libp7zip:1.7.0'
+    // The APK bundles libp7zip; the small Java bridge is kept in the source tree
+    // so builds do not depend on the discontinued Maven artifact.
 //    implementation "com.github.seven332.a7zip:extract:master-SNAPSHOT"
 //    implementation 'com.github.omicronapps:7-Zip-JBinding-4Android:Release-16.02-2.02'
 //    implementation 'com.victor:lib:1.0.4'
-    implementation 'com.cleveroad:androidmanimation:0.9.1'
 
     def appCenterSdkVersion = '4.3.1'
     implementation "com.microsoft.appcenter:appcenter-analytics:${appCenterSdkVersion}"
