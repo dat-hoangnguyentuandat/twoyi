@@ -94,10 +94,13 @@ pub fn renderer_init(
         });
 
         let loader_path: String = env.get_string(loader.into()).unwrap().into();
-        let working_dir = "/data/data/io.twoyi/rootfs";
         let log_path = "/data/data/io.twoyi/log.txt";
         let outputs = File::create(log_path).unwrap();
         let errors = outputs.try_clone().unwrap();
+        // Twoyi's loader virtualizes the guest filesystem and credentials in
+        // the app process.  Never route this through host su: the APK must run
+        // unchanged on an ordinary, non-rooted Android device.
+        let working_dir = "/data/data/io.twoyi/rootfs";
         let _ = Command::new("./init")
             .current_dir(working_dir)
             .env("TYLOADER", loader_path)
