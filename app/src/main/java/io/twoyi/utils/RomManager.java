@@ -13,6 +13,7 @@ import android.content.res.AssetManager;
 import android.os.Build;
 import android.os.Process;
 import android.os.SystemClock;
+import android.system.Os;
 import android.util.DisplayMetrics;
 import android.util.Log;
 
@@ -38,8 +39,11 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.Locale;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Properties;
 import java.util.TimeZone;
+import java.util.stream.Stream;
 
 /**
  * @author weishu
@@ -59,6 +63,9 @@ public final class RomManager {
     private static final String LOADER_FILE = "libloader.so";
 
     private static final String CUSTOM_ROM_FILE_NAME = "rootfs_3rd.7z";
+
+    /** Created only after the complete rootfs extraction and permission pass. */
+    private static final String ROOTFS_READY_FILE = ".twoyi-extract-complete";
 
     private RomManager() {
     }
@@ -101,6 +108,34 @@ public final class RomManager {
         killOrphanProcess();
 
         saveLastKmsg(context);
+    }
+
+    /**
+     * The root launcher must not infer completion from the first large ELF:
+     * p7zip writes the tree incrementally and the init binary can arrive
+     * before system/lib64.  This method repairs an already-installed ROM and
+     * publishes the same completion marker used after a fresh extraction.
+     */
+    public static void ensureRootfsReady(Context context) {
+        File root = getRootfsDir(context);
+        if (!root.exists()) {
+            return;
+        }
+
+        File marker = new File(root, ROOTFS_READY_FILE);
+        if (!marker.isFile()) {
+            repairGuestSymlinks(context);
+            normalizeRootfsPermissions(context);
+            writeRootfsReadyMarker(context);
+        }
+    }
+
+    /** Prevent an external launcher from entering the old tree while an
+     * asynchronous factory-ROM replacement is about to begin. */
+    public static void invalidateRootfsReady(Context context) {
+        File marker = new File(getRootfsDir(context), ROOTFS_READY_FILE);
+        //noinspection ResultOfMethodCallIgnored
+        marker.delete();
     }
 
     private static void createLoaderSymlink(Context context) {
@@ -281,9 +316,22 @@ public final class RomManager {
 
     public static int extractRootfs(Context context, File rootfs7z) {
 
+        File marker = new File(getRootfsDir(context), ROOTFS_READY_FILE);
+        // The marker is never part of the ROM archive; remove it before every
+        // replacement so the external launcher cannot enter a partial tree.
+        //noinspection ResultOfMethodCallIgnored
+        marker.delete();
+
         int cpu = Runtime.getRuntime().availableProcessors();
-        return P7ZipApi.executeCommand(String.format(Locale.US, "7z x -mmt=%d -aoa '%s' '-o%s'",
+        int result = P7ZipApi.executeCommand(String.format(Locale.US, "7z x -mmt=%d -aoa '%s' '-o%s'",
                 cpu, rootfs7z, context.getDataDir()));
+
+        if (result == 0) {
+            repairGuestSymlinks(context);
+            normalizeRootfsPermissions(context);
+            writeRootfsReadyMarker(context);
+        }
+        return result;
     }
 
     public static boolean extractRootfsInAssets(Context context) {
@@ -310,6 +358,81 @@ public final class RomManager {
         Log.i(TAG, "extract rootfs, read assets: " + (t2 - t1) + " un7z: " + (t3 - t2) + "ret: " + ret);
 
         return ret == 0;
+    }
+
+    /** libp7zip inherits the app umask on some Android builds and extracts files as 0700. */
+    private static void normalizeRootfsPermissions(Context context) {
+        Path root = getRootfsDir(context).toPath();
+        try (Stream<Path> paths = Files.walk(root)) {
+            paths.forEach(path -> {
+                try {
+                    if (Files.isSymbolicLink(path)) {
+                        return;
+                    }
+                    Os.chmod(path.toString(), Files.isDirectory(path) ? 0755 : 0755);
+                } catch (Throwable e) {
+                    Log.w(TAG, "chmod failed: " + path, e);
+                }
+            });
+        } catch (IOException e) {
+            Log.w(TAG, "rootfs permission normalization failed", e);
+        }
+    }
+
+    private static void writeRootfsReadyMarker(Context context) {
+        File marker = new File(getRootfsDir(context), ROOTFS_READY_FILE);
+        File temporary = new File(getRootfsDir(context), ROOTFS_READY_FILE + ".tmp");
+        try (FileOutputStream output = new FileOutputStream(temporary, false)) {
+            output.write('1');
+            output.getFD().sync();
+            if (!temporary.renameTo(marker)) {
+                throw new IOException("rename rootfs ready marker failed");
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "rootfs ready marker failed", e);
+        }
+    }
+
+    /**
+     * libp7zip on some Android builds cannot materialize Unix symlink entries
+     * from a 7z archive and leaves their target text as a regular file.  The
+     * guest init then sees /vendor and /etc as files, and the EGL loader cannot
+     * resolve its vendor libraries.  All paths here are inside app-private
+     * storage, so recreating them does not touch the physical device.
+     */
+    private static void repairGuestSymlinks(Context context) {
+        File root = getRootfsDir(context);
+        Map<String, String> links = new HashMap<>();
+        links.put("vendor", "system/vendor");
+        links.put("etc", "system/etc");
+        links.put("sdcard", "storage/self/primary");
+        links.put("system/bin/app_process", "app_process64");
+        links.put("system/bin/mkdir", "toybox");
+        links.put("system/bin/mount", "toybox");
+        links.put("system/bin/chmod", "toybox");
+        links.put("system/bin/chown", "toybox");
+        links.put("system/bin/ln", "toybox");
+        links.put("system/bin/rm", "toybox");
+        links.put("system/bin/cp", "toybox");
+        links.put("system/bin/mv", "toybox");
+        links.put("system/bin/getprop", "toybox");
+        links.put("system/bin/setprop", "toybox");
+        links.put("system/bin/start", "toybox");
+        links.put("system/bin/stop", "toybox");
+
+        for (Map.Entry<String, String> link : links.entrySet()) {
+            File path = new File(root, link.getKey());
+            File target = new File(path.getParentFile(), link.getValue());
+            if (!target.exists() && !Files.isSymbolicLink(target.toPath())) {
+                continue;
+            }
+            try {
+                Files.deleteIfExists(path.toPath());
+                Files.createSymbolicLink(path.toPath(), Paths.get(link.getValue()));
+            } catch (Throwable e) {
+                Log.w(TAG, "guest symlink repair failed: " + path, e);
+            }
+        }
     }
 
     public static File getRootfsDir(Context context) {
