@@ -40,6 +40,8 @@ import com.topjohnwu.superuser.Shell;
 
 import java.util.LinkedList;
 import java.util.List;
+import java.io.File;
+import java.io.RandomAccessFile;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -54,7 +56,7 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
 
     private final AtomicBoolean mRendering = new AtomicBoolean(false);
 
-    private final LimitedQueue<String> mLogMessages = new LimitedQueue<>(160);
+    private final LimitedQueue<String> mLogMessages = new LimitedQueue<>(400);
     private final LinkedList<String> mSnapShot = new LinkedList<>();
 
     private final SparseArray<Paint> mPaints = new SparseArray<>();
@@ -155,8 +157,17 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
                 }
             };
 
+            addMessage("I [twoyi] boot console attached");
+
+            // Keep logcat alive for the whole boot instead of stopping after
+            // 30 seconds.  Verbose output is useful here because early loader
+            // and linker diagnostics are exactly what a failed guest needs.
             Shell shell = ShellUtil.newSh();
-            shell.newJob().add("timeout -s 9 30 logcat -v brief *I").to(callbackList).submit();
+            shell.newJob().add("logcat -v brief '*:V'").to(callbackList).submit();
+
+            Thread guestLog = new Thread(this::followGuestLog, "guest-boot-log");
+            guestLog.setDaemon(true);
+            guestLog.start();
 
             while (mRendering.get()) {
                 render();
@@ -169,6 +180,41 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
             }
 
         });
+    }
+
+    private void addMessage(String message) {
+        if (TextUtils.isEmpty(message)) {
+            return;
+        }
+        synchronized (mLogMessages) {
+            mLogMessages.add(message);
+        }
+    }
+
+    /** Follow stdout/stderr produced by rootfs/init.  logcat alone misses the
+     * loader, linker and init-parser failures that happen before logd exists. */
+    private void followGuestLog() {
+        File file = new File(getContext().getDataDir(), "log.txt");
+        long position = 0;
+        while (mRendering.get()) {
+            if (!file.isFile()) {
+                SystemClock.sleep(50);
+                continue;
+            }
+            try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+                if (input.length() < position) {
+                    position = 0;
+                }
+                input.seek(position);
+                String line;
+                while (mRendering.get() && (line = input.readLine()) != null) {
+                    addMessage("I [guest] " + line);
+                }
+                position = input.getFilePointer();
+            } catch (Throwable ignored) {
+            }
+            SystemClock.sleep(50);
+        }
     }
 
     @Override
@@ -202,8 +248,12 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
                 mSnapShot.addAll(mLogMessages);
             }
 
-            int count = 0;
-            for (String log : mSnapShot) {
+            int lineHeight = 20;
+            int visibleLines = Math.max(1, getHeight() / lineHeight);
+            int first = Math.max(0, mSnapShot.size() - visibleLines);
+            int count = 1;
+            for (int index = first; index < mSnapShot.size(); index++) {
+                String log = mSnapShot.get(index);
 
                 char chr = log.charAt(0);
 
@@ -212,7 +262,7 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
                     paint = mDefaultPaint;
                 }
 
-                canvas.drawText(log, 0, count++ * 20, paint);
+                canvas.drawText(log, 0, count++ * lineHeight, paint);
             }
 
         } finally {

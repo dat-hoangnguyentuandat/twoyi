@@ -34,10 +34,9 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.ProgressBar;
 
 import androidx.annotation.NonNull;
-
-import com.cleveroad.androidmanimation.LoadingAnimationView;
 
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -58,8 +57,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     private SurfaceView mSurfaceView;
 
     private ViewGroup mRootView;
-    private LoadingAnimationView mLoadingView;
     private TextView mLoadingText;
+    private ProgressBar mLoadingSpinner;
     private View mLoadingLayout;
     private View mBootLogView;
 
@@ -77,7 +76,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             float xdpi = displayMetrics.xdpi;
             float ydpi = displayMetrics.ydpi;
 
-            Renderer.init(surface, RomManager.getLoaderPath(getApplicationContext()), xdpi, ydpi, (int) getBestFps());
+            Renderer.init(surface, xdpi, ydpi, (int) getBestFps());
 
             Log.i(TAG, "surfaceCreated");
         }
@@ -122,12 +121,12 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         mSurfaceView.getHolder().addCallback(mSurfaceCallback);
 
         mLoadingLayout = findViewById(R.id.loadingLayout);
-        mLoadingView = findViewById(R.id.loading);
         mLoadingText = findViewById(R.id.loadingText);
+        mLoadingSpinner = findViewById(R.id.loadingSpinner);
         mBootLogView = findViewById(R.id.bootlog);
 
         mLoadingLayout.setVisibility(View.VISIBLE);
-        mLoadingView.startAnimation();
+        mLoadingSpinner.setVisibility(View.VISIBLE);
 
         UITips.checkForAndroid12(this, this::bootSystem);
 
@@ -156,6 +155,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         if (shouldExtractRom) {
             Log.i(TAG, "extracting rom...");
 
+            // Invalidate synchronously, before the worker starts.  The root
+            // bridge watches this marker from another process and otherwise
+            // can enter the old tree while p7zip is replacing executables.
+            RomManager.invalidateRootfsReady(getApplicationContext());
+
             showTipsForFirstBoot();
 
             new Thread(() -> {
@@ -171,8 +175,16 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                 });
             }, "extract-rom").start();
         } else {
-            mRootView.addView(mSurfaceView, 0);
-            showBootingProcedure();
+            new Thread(() -> {
+                // Older installs do not have the completion marker.  Repair
+                // their permissions before the root bridge is allowed to
+                // start the guest.
+                RomManager.ensureRootfsReady(getApplicationContext());
+                runOnUiThread(() -> {
+                    mRootView.addView(mSurfaceView, 0);
+                    showBootingProcedure();
+                });
+            }, "prepare-existing-rom").start();
         }
     }
 
@@ -200,32 +212,32 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     private void showBootingProcedure() {
         // mLoadingText.setText(R.string.booting_tips);
         mLoadingText.setVisibility(View.GONE);
+        mLoadingSpinner.setVisibility(View.GONE);
         mBootLogView.setVisibility(View.VISIBLE);
         new Thread(() -> {
 
             if (true) {
                 boolean success = false;
                 try {
-                    success = TwoyiStatusManager.getInstance().waitBoot(15, TimeUnit.SECONDS);
+                    // The rooted guest performs Magisk post-fs-data work before
+                    // system_server can publish BOOT_COMPLETED.  Fifteen seconds
+                    // is too short on a clean install and makes the healthy host
+                    // activity call System.exit(0) while Android is still booting.
+                    success = TwoyiStatusManager.getInstance().waitBoot(45, TimeUnit.SECONDS);
                 } catch (Throwable ignored) {
                 }
 
                 if (!success) {
                     LogEvents.trackBootFailure(getApplicationContext());
-
-                    runOnUiThread(() -> Toast.makeText(getApplicationContext(), R.string.boot_failed, Toast.LENGTH_SHORT).show());
-
-                    // waiting for track
-                    SystemClock.sleep(3000);
-
-                    finish();
-                    System.exit(0);
+                    // A rooted/chrooted guest can finish booting without its
+                    // legacy socket notification reaching the host process.
+                    // Keep the live renderer instead of killing a healthy ROM.
+                    runOnUiThread(() -> mLoadingLayout.setVisibility(View.GONE));
                     return;
                 }
             }
 
             runOnUiThread(() -> {
-                mLoadingView.stopAnimation();
                 mLoadingLayout.setVisibility(View.GONE);
             });
         }, "waiting-boot").start();
